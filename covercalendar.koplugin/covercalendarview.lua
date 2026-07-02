@@ -31,7 +31,6 @@ local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
 local Widget          = require("ui/widget/widget")
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger          = require("logger")
 local _ = require("gettext")
 
@@ -44,6 +43,10 @@ local TITLE_SIZE   = 8
 local DOW_SIZE     = 11
 local MONTH_SIZE   = 16
 local BORDER       = 1
+-- Softer border color for day cells — full black (default FrameContainer
+-- behavior) makes the grid feel rigid; a mid-gray reads as card edges
+-- without the hard pixel-grid look.
+local CELL_BORDER_COLOR = Blitbuffer.gray(0.6)
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 local function daysInMonth(year, month)
@@ -104,8 +107,11 @@ local function loadMonthData(db_path, year, month)
         SELECT
             strftime('%%Y-%%m-%%d', psd.start_time, 'unixepoch', 'localtime') AS ds,
             b.title AS title,
+            b.authors AS authors,
+            b.series AS series,
             b.id AS book_id,
             SUM(psd.duration) AS dur,
+            COUNT(DISTINCT psd.page) AS pages_today,
             b.pages AS pages,
             b.total_read_pages AS total_read_pages,
             MAX(psd.start_time) AS last_seen
@@ -129,23 +135,30 @@ local function loadMonthData(db_path, year, month)
         return result
     end
 
-    -- res is column-major: res[1]=ds, res[2]=title, res[3]=book_id, res[4]=dur,
-    -- res[5]=pages, res[6]=total_read_pages, res[7]=last_seen
+    -- res is column-major: res[1]=ds, res[2]=title, res[3]=authors, res[4]=series,
+    -- res[5]=book_id, res[6]=dur, res[7]=pages_today, res[8]=pages,
+    -- res[9]=total_read_pages, res[10]=last_seen
     local n_rows = res[1] and #res[1] or 0
     logger.info("CoverCalendar: loadMonthData got", n_rows, "rows for", year, month)
 
     for i = 1, n_rows do
-        local ds    = res[1][i]
-        local title = res[2][i]
-        local dur   = tonumber(res[4][i]) or 0
-        local pages = tonumber(res[5] and res[5][i]) or 0
-        local total_read_pages = tonumber(res[6] and res[6][i]) or 0
+        local ds          = res[1][i]
+        local title       = res[2][i]
+        local authors     = res[3] and res[3][i] or ""
+        local series_raw  = res[4] and res[4][i] or ""
+        local series      = (series_raw == "N/A") and "" or series_raw
+        local dur         = tonumber(res[6] and res[6][i]) or 0
+        local pages_today = tonumber(res[7] and res[7][i]) or 0
+        local pages       = tonumber(res[8] and res[8][i]) or 0
+        local total_read_pages = tonumber(res[9] and res[9][i]) or 0
         if not result[ds] then result[ds] = {} end
         table.insert(result[ds], {
-            title = title,
-            notes = "",
-            dur   = dur,
-            pages = pages,
+            title       = title,
+            authors     = authors or "",
+            series      = series or "",
+            dur         = dur,
+            pages_today = pages_today,
+            pages       = pages,
             total_read_pages = total_read_pages,
         })
     end
@@ -154,12 +167,110 @@ local function loadMonthData(db_path, year, month)
     return result
 end
 
--- ── Empty cell ────────────────────────────────────────────────────────────────
+-- ── All-time streak calculation ───────────────────────────────────────────────
+-- Queries every reading session ever recorded to find the true longest and
+-- current streaks, not limited to the displayed month.
+-- Returns { current = N, longest = N } where N is in days.
+local function loadAllTimeStreaks(db_path)
+    local result = { current = 0, longest = 0 }
+
+    local ok, SQ3 = pcall(require, "lua-ljsqlite3/init")
+    if not ok or not SQ3 then return result end
+
+    local ok2, conn = pcall(SQ3.open, db_path)
+    if not ok2 or not conn then return result end
+
+    -- Get every distinct calendar day that had any reading, sorted ascending.
+    -- Using page_stat_data; falls back to page_stat view if that fails.
+    local sql = [[
+        SELECT DISTINCT
+            strftime('%Y-%m-%d', start_time, 'unixepoch', 'localtime') AS ds
+        FROM page_stat_data
+        ORDER BY ds ASC
+    ]]
+
+    local ok3, res = pcall(function() return conn:exec(sql) end)
+    if not ok3 or not res then
+        local sql2 = sql:gsub("page_stat_data", "page_stat")
+        ok3, res = pcall(function() return conn:exec(sql2) end)
+    end
+
+    if not ok3 or not res or not res[1] then
+        pcall(function() conn:close() end)
+        return result
+    end
+
+    local days = res[1]   -- array of "YYYY-MM-DD" strings, sorted
+    local n = #days
+    if n == 0 then
+        pcall(function() conn:close() end)
+        return result
+    end
+
+    -- Walk the sorted day list and find runs of consecutive calendar days.
+    -- "Consecutive" means the next day is exactly 1 day after the previous,
+    -- regardless of month or year boundaries — this is the key improvement
+    -- over the old month-scoped approach.
+    local function toTimestamp(ds)
+        local y, m, d = ds:match("(%d+)-(%d+)-(%d+)")
+        if not y then return nil end
+        return os.time{year=tonumber(y), month=tonumber(m), day=tonumber(d),
+                       hour=0, min=0, sec=0}
+    end
+
+    local longest = 1
+    local current_run = 1
+    local prev_ts = toTimestamp(days[1])
+
+    for i = 2, n do
+        local ts = toTimestamp(days[i])
+        if not ts or not prev_ts then break end
+        local diff_days = math.floor((ts - prev_ts) / 86400 + 0.5)
+        if diff_days == 1 then
+            current_run = current_run + 1
+            if current_run > longest then longest = current_run end
+        else
+            current_run = 1
+        end
+        prev_ts = ts
+    end
+
+    result.longest = longest
+
+    -- Current streak: walk backwards from today and count consecutive days.
+    local today_ts = os.time(os.date("*t"))
+    -- Normalize to midnight local time.
+    local today_d = os.date("*t", today_ts)
+    today_ts = os.time{year=today_d.year, month=today_d.month, day=today_d.day,
+                       hour=0, min=0, sec=0}
+
+    local streak = 0
+    for i = n, 1, -1 do
+        local ts = toTimestamp(days[i])
+        if not ts then break end
+        local diff = math.floor((today_ts - ts) / 86400 + 0.5)
+        if diff == streak then
+            streak = streak + 1
+        elseif diff == streak + 1 and streak == 0 then
+            -- Yesterday counts as current streak too (you haven't read today yet)
+            streak = 1
+        else
+            break
+        end
+    end
+    result.current = streak
+
+    pcall(function() conn:close() end)
+    return result
+end
+
+
 local function makeEmptyCell(w, h)
     local radius = math.floor(math.min(w, h) * 0.18)
     return FrameContainer:new{
         width=w, height=h, padding=0, bordersize=BORDER, radius=radius,
-        background=Blitbuffer.gray(0.95),
+        color=CELL_BORDER_COLOR,
+        background=Blitbuffer.COLOR_WHITE,
         VerticalSpan:new{width=1, height=1},
     }
 end
@@ -168,12 +279,13 @@ end
 local DayCell = InputContainer:extend{
     width=0, height=0, day=0, day_str="",
     books=nil, title_path_map=nil,
-    show_title=false, is_today=false,
-    cover_size="compact",  -- "compact" | "cozy" | "large"
-    stack_covers=true,     -- show a fanned stack for multi-book days
-    in_streak=false,       -- this day is part of an active reading streak
+    is_today=false,
+    cover_size="compact",
+    stack_covers=true,
+    in_streak=false,
     today_color_id="none",
-    streak_color_id="none",
+    skip_covers=false,
+    cell_time=false,
 }
 
 -- Cover fill ratio per size setting (fraction of the available vertical
@@ -237,8 +349,6 @@ function DayCell:init()
     local cell_bg = Blitbuffer.COLOR_WHITE
     if self.is_today then
         cell_bg = resolvePresetColor(self.today_color_id or "none")
-    elseif self.in_streak then
-        cell_bg = resolvePresetColor(self.streak_color_id or "none")
     end
 
     local CELL_RADIUS = math.floor(math.min(W, H) * 0.18)
@@ -263,7 +373,8 @@ function DayCell:init()
     local num_widget
     if self.is_today then
         num_widget = FrameContainer:new{
-            padding=2, bordersize=0, radius=Screen:scaleBySize(8),
+            padding=5, padding_left=7, padding_right=7,
+            bordersize=0, radius=Screen:scaleBySize(8),
             background=Blitbuffer.COLOR_BLACK,
             TextWidget:new{
                 text=tostring(self.day), face=num_face, bold=true,
@@ -285,8 +396,64 @@ function DayCell:init()
     }
     table.insert(content, num_widget)
 
-    -- ── Cover, anchored to the BOTTOM of the cell (matches reference image) ──
-    if top and cover_h > 8 and cover_w > 8 then
+
+    -- Reading time badge: right-aligned pill in the top area.
+    -- On non-streak days: light gray background, black text.
+    -- On streak days (and only when cell_time is enabled): colored
+    -- background (user-chosen via streak_highlight_color) so the badge
+    -- doubles as the streak indicator.
+    -- Streak highlight only appears when cell_time is on — turning off
+    -- the time hides the streak highlight too.
+    if self.cell_time and #books > 0 then
+        local total_secs = 0
+        for _, b in ipairs(books) do total_secs = total_secs + (b.dur or 0) end
+        if total_secs > 0 then
+            local mins = math.floor(total_secs / 60)
+            local time_str
+            if mins >= 60 then
+                time_str = math.floor(mins / 60) .. "h"
+            elseif mins > 0 then
+                time_str = mins .. "m"
+            end
+            if time_str then
+                local time_face = Font:getFace("cfont", TITLE_SIZE + 2)
+
+                -- Resolve badge background color.
+                local badge_bg, badge_fg
+                if self.in_streak then
+                    -- Fixed reddish tint for streak days on color screens,
+                    -- light gray on grayscale e-ink.
+                    if has_color and ok_rgb and RGB32 then
+                        badge_bg = RGB32(255, 200, 195)  -- soft coral-red
+                        badge_fg = Blitbuffer.COLOR_BLACK
+                    else
+                        badge_bg = Blitbuffer.COLOR_LIGHT_GRAY
+                        badge_fg = Blitbuffer.COLOR_BLACK
+                    end
+                else
+                    badge_bg = Blitbuffer.COLOR_LIGHT_GRAY
+                    badge_fg = Blitbuffer.COLOR_BLACK
+                end
+
+                table.insert(content, RightContainer:new{
+                    dimen = Geom:new{w=W - NUM_INSET_X, h=num_h + NUM_INSET_Y},
+                    FrameContainer:new{
+                        padding=4, padding_left=6, padding_right=6,
+                        bordersize=0,
+                        radius=Screen:scaleBySize(8),
+                        background=badge_bg,
+                        TextWidget:new{
+                            text    = time_str,
+                            face    = time_face,
+                            bold    = true,
+                            fgcolor = badge_fg,
+                        },
+                    },
+                })
+            end
+        end
+    end
+    if top and cover_h > 8 and cover_w > 8 and not self.skip_covers then
         local function resolveCoverWidget(book, w, h)
             local path = self.title_path_map and CoverUtil.findPathForTitle(self.title_path_map, book.title)
             logger.info("CoverCalendar: day", self.day_str, "book='" .. tostring(book.title) .. "' path=" .. tostring(path))
@@ -317,8 +484,8 @@ function DayCell:init()
                     end
 
                     return FrameContainer:new{
-                        padding=0, bordersize=1, radius=Screen:scaleBySize(3),
-                        width=w + 2, height=h + 2,
+                        padding=0, bordersize=0,
+                        width=w, height=h,
                         BottomContainer:new{
                             dimen = Geom:new{w=w, h=h},
                             CenterContainer:new{
@@ -433,23 +600,11 @@ function DayCell:init()
                 })
             end
         end
-
-        if self.show_title then
-            local t = top.title
-            local max_chars = math.floor(cover_w / (TITLE_SIZE * 0.55))
-            if #t > max_chars then t = t:sub(1, max_chars-1) .. "…" end
-            table.insert(content, FrameContainer:new{
-                padding=0, padding_top=num_h, bordersize=0,
-                TextWidget:new{
-                    text=t, face=title_face,
-                    fgcolor=Blitbuffer.COLOR_BLACK,
-                },
-            })
-        end
     end
 
     self[1] = FrameContainer:new{
         width=W, height=H, padding=0, bordersize=BORDER, radius=CELL_RADIUS,
+        color=CELL_BORDER_COLOR,
         background=cell_bg,
         content,
     }
@@ -495,29 +650,428 @@ end
 function DayCell:onTap()
     local books = self.books or {}
     if #books == 0 then return true end
-    local lines = {self.day_str .. ":"}
-    for _, b in ipairs(books) do
-        table.insert(lines, string.format("• %s  (%d min)",
-            b.title, math.floor(b.dur / 60)))
+
+    local self_cell = self
+    local SW = Screen:getWidth()
+    local SH = Screen:getHeight()
+    local POPUP_PAD = Screen:scaleBySize(16)
+    local popup_w   = math.min(SW - Screen:scaleBySize(60), Screen:scaleBySize(380))
+    local inner_w   = popup_w - POPUP_PAD * 2
+    local COVER_W   = Screen:scaleBySize(64)
+    local COVER_H   = Screen:scaleBySize(88)
+
+    -- Date (shared across all books for this day)
+    local MN = {"January","February","March","April","May","June",
+                 "July","August","September","October","November","December"}
+    local DN = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"}
+    local py, pm, pd = self.day_str:match("(%d+)-(%d+)-(%d+)")
+    local wday = os.date("*t", os.time{
+        year=tonumber(py), month=tonumber(pm), day=tonumber(pd)}).wday
+    local nice_date = DN[wday] .. ", " .. MN[tonumber(pm)] .. " " .. tonumber(pd)
+
+    -- Shared fonts and layout helpers
+    local date_face  = Font:getFace("cfont", 13)
+    local title_face = Font:getFace("cfont", 14)
+    local meta_face  = Font:getFace("cfont", 11)
+    local val_face   = Font:getFace("cfont", 17)
+    local lbl_face   = Font:getFace("cfont", 10)
+    local x_face     = Font:getFace("cfont", 18)
+
+    local SEP_W = Screen:scaleBySize(1)
+    local SEP_H = Screen:scaleBySize(44)  -- taller sep = more room for stats centering
+    local col_w = math.floor((inner_w - SEP_W * 2) / 3)
+    local info_w = inner_w - COVER_W - Screen:scaleBySize(22)
+
+    local function statBlock(val, lbl)
+        return CenterContainer:new{
+            dimen=Geom:new{w=col_w, h=SEP_H},
+            VerticalGroup:new{ overlap=false,
+                CenterContainer:new{
+                    dimen=Geom:new{w=col_w, h=Screen:scaleBySize(24)},
+                    TextWidget:new{
+                        text=val, face=val_face, bold=true,
+                        fgcolor=Blitbuffer.COLOR_BLACK,
+                    },
+                },
+                CenterContainer:new{
+                    dimen=Geom:new{w=col_w, h=Screen:scaleBySize(16)},
+                    TextWidget:new{
+                        text=lbl, face=lbl_face,
+                        fgcolor=Blitbuffer.COLOR_BLACK,
+                    },
+                },
+            },
+        }
     end
-    local InfoMessage = require("ui/widget/infomessage")
-    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
+
+    local function pipe()
+        return CenterContainer:new{
+            dimen=Geom:new{w=SEP_W, h=SEP_H},
+            LineWidget:new{
+                background=Blitbuffer.COLOR_LIGHT_GRAY, line_width=SEP_W,
+                dimen=Geom:new{w=SEP_W, h=SEP_H},
+            },
+        }
+    end
+
+    -- Forward-declare showCard so buildCard's button callbacks can
+    -- reference it as an upvalue even though showCard is defined later.
+    local showCard
+
+    -- Build the card content for book at index idx
+    local function buildCard(idx)
+        local book = books[idx]
+
+        -- Per-book time read
+        local book_secs = book.dur or 0
+        local hrs  = math.floor(book_secs / 3600)
+        local mins = math.floor((book_secs % 3600) / 60)
+        local time_val = (hrs > 0)
+            and string.format("%dh %dm", hrs, mins)
+            or  (mins > 0 and string.format("%dm", mins) or "—")
+
+        -- Per-book stats from sidecar
+        local pct_val    = "—"
+        local status_str = nil
+        local pages_val  = (book.pages_today and book.pages_today > 0)
+            and tostring(book.pages_today) or "—"
+
+        if self_cell.title_path_map then
+            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title)
+            if path then
+                local ok_ds, DocSettings = pcall(require, "docsettings")
+                if ok_ds and DocSettings then
+                    local ok_sd, sidecar = pcall(DocSettings.open, DocSettings, path)
+                    if ok_sd and sidecar then
+                        local pf = sidecar:readSetting("percent_finished")
+                        if pf and type(pf) == "number" then
+                            pct_val = math.floor(pf * 100) .. "%"
+                        end
+                        local summary = sidecar:readSetting("summary")
+                        if summary and type(summary) == "table" then
+                            local s = summary.status
+                            if s == "complete" or s == "finished" then
+                                status_str = "✓ Finished"
+                            elseif s == "reading" then
+                                status_str = "Reading"
+                            elseif s == "abandoned" then
+                                status_str = "Abandoned"
+                            elseif s == "on_hold" or s == "onhold" then
+                                status_str = "On hold"
+                            elseif pct_val ~= "—" then
+                                status_str = "Reading"
+                            end
+                        elseif pct_val ~= "—" then
+                            status_str = "Reading"
+                        end
+                    end
+                end
+            end
+        end
+        if pct_val == "—" then
+            if book.pages and book.pages > 0
+               and book.total_read_pages and book.total_read_pages > 0 then
+                pct_val = math.min(100,
+                    math.floor(book.total_read_pages / book.pages * 100)) .. "%"
+            end
+        end
+
+        -- Cover
+        local cover_widget = nil
+        if self_cell.title_path_map then
+            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title)
+            if path then
+                local ok_bim, BIM = pcall(require, "bookinfomanager")
+                if ok_bim and BIM then
+                    local ok_bi, bi = pcall(BIM.getBookInfo, BIM, path, true)
+                    if ok_bi and bi and bi.cover_bb then
+                        local sf
+                        local ok2, _, _, csf = pcall(
+                            BIM.getCachedCoverSize, BIM, bi.cover_w, bi.cover_h,
+                            COVER_W, COVER_H)
+                        if ok2 and csf then sf = csf else
+                            sf = math.min(COVER_W/(bi.cover_w or COVER_W),
+                                          COVER_H/(bi.cover_h or COVER_H))
+                        end
+                        local ok_iw, IW = pcall(require, "ui/widget/imagewidget")
+                        if ok_iw then
+                            local ok_cp, bb_copy = pcall(function()
+                                return bi.cover_bb:copy() end)
+                            if ok_cp and bb_copy then
+                                local ok_img, img = pcall(IW.new, IW, {
+                                    image=bb_copy, scale_factor=sf,
+                                    image_disposable=true,
+                                })
+                                if ok_img and img then
+                                    local ok_sz, img_sz = pcall(function()
+                                        return img:getSize() end)
+                                    local ah = COVER_H
+                                    if ok_sz and img_sz and img_sz.h > 0 then
+                                        ah = math.min(img_sz.h, COVER_H)
+                                    end
+                                    cover_widget = FrameContainer:new{
+                                        padding=0, bordersize=0,
+                                        width=COVER_W, height=COVER_H,
+                                        BottomContainer:new{
+                                            dimen=Geom:new{w=COVER_W, h=COVER_H},
+                                            CenterContainer:new{
+                                                dimen=Geom:new{w=COVER_W, h=ah},
+                                                img,
+                                            },
+                                        },
+                                    }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if not cover_widget then
+            cover_widget = FrameContainer:new{
+                padding=4, bordersize=1, radius=Screen:scaleBySize(4),
+                width=COVER_W, height=COVER_H,
+                background=Blitbuffer.COLOR_LIGHT_GRAY,
+                CenterContainer:new{
+                    dimen=Geom:new{w=COVER_W-8, h=COVER_H-8},
+                    TextWidget:new{
+                        text=book.title:sub(1,6), face=lbl_face,
+                        fgcolor=Blitbuffer.COLOR_BLACK,
+                    },
+                },
+            }
+        end
+
+        -- Book info column — use max_width on TextWidget so KOReader's own
+        -- glyph renderer handles truncation correctly rather than our rough
+        -- character-count estimate which overflows on wide characters/fonts.
+        local book_col = VerticalGroup:new{ overlap=false,
+            TextWidget:new{
+                text=book.title, face=title_face, bold=true,
+                max_width=info_w,
+                fgcolor=Blitbuffer.COLOR_BLACK,
+            },
+        }
+        local author_str = (book.authors and book.authors ~= "") and book.authors or nil
+        if author_str then
+            table.insert(book_col, VerticalSpan:new{height=Screen:scaleBySize(3)})
+            table.insert(book_col, TextWidget:new{
+                text=author_str, face=meta_face, max_width=info_w,
+                fgcolor=Blitbuffer.COLOR_BLACK,
+            })
+        end
+        local series_str = (book.series and book.series ~= "" and book.series ~= "N/A")
+            and book.series or nil
+        if series_str then
+            table.insert(book_col, VerticalSpan:new{height=Screen:scaleBySize(2)})
+            table.insert(book_col, TextWidget:new{
+                text=series_str, face=meta_face, max_width=info_w,
+                fgcolor=Blitbuffer.COLOR_BLACK,
+            })
+        end
+        if status_str then
+            table.insert(book_col, VerticalSpan:new{height=Screen:scaleBySize(5)})
+            table.insert(book_col, FrameContainer:new{
+                padding=3, padding_left=7, padding_right=7,
+                bordersize=1, radius=Screen:scaleBySize(6),
+                TextWidget:new{
+                    text=status_str, face=Font:getFace("cfont", 10), bold=true,
+                    fgcolor=Blitbuffer.COLOR_BLACK,
+                },
+            })
+        end
+
+        local top_row = HorizontalGroup:new{ overlap=false,
+            HorizontalSpan:new{width=Screen:scaleBySize(8)},
+            cover_widget,
+            HorizontalSpan:new{width=Screen:scaleBySize(14)},
+            CenterContainer:new{
+                dimen=Geom:new{w=info_w, h=COVER_H},
+                book_col,
+            },
+        }
+
+        -- Book-specific stats (pages + percent) with total time shared
+        local stats_row = HorizontalGroup:new{ overlap=false,
+            statBlock(time_val, "time read"),
+            pipe(),
+            statBlock(pages_val, "pages"),
+            pipe(),
+            statBlock(pct_val, "of book"),
+        }
+
+        -- Navigation row: ‹ dots › — only shown when multiple books
+        local nav_row = nil
+        if #books > 1 then
+            local arrow_face = Font:getFace("cfont", 22)
+            local dot_face   = Font:getFace("cfont", 11)
+            local prev_idx = ((idx - 2) % #books) + 1
+            local next_idx = (idx % #books) + 1
+
+            local dots_group = HorizontalGroup:new{ overlap=false }
+            for i = 1, #books do
+                table.insert(dots_group, TextWidget:new{
+                    text  = (i == idx) and "●" or "○",
+                    face  = dot_face,
+                    fgcolor = Blitbuffer.COLOR_BLACK,
+                })
+                if i < #books then
+                    table.insert(dots_group,
+                        HorizontalSpan:new{width=Screen:scaleBySize(6)})
+                end
+            end
+
+            local NAV_H = Screen:scaleBySize(44)
+            nav_row = OverlapGroup:new{
+                dimen=Geom:new{w=inner_w, h=NAV_H},
+                allow_mirroring=false,
+                -- left arrow — bigger tap target
+                FrameContainer:new{
+                    padding=0, bordersize=0,
+                    Button:new{
+                        text="‹", face=arrow_face,
+                        bordersize=0,
+                        padding=Screen:scaleBySize(8),
+                        callback=function()
+                            showCard(prev_idx)
+                        end,
+                    },
+                },
+                -- dots centred
+                CenterContainer:new{
+                    dimen=Geom:new{w=inner_w, h=NAV_H},
+                    dots_group,
+                },
+                -- right arrow — bigger tap target
+                RightContainer:new{
+                    dimen=Geom:new{w=inner_w, h=NAV_H},
+                    FrameContainer:new{
+                        padding=0, bordersize=0,
+                        Button:new{
+                            text="›", face=arrow_face,
+                            bordersize=0,
+                            padding=Screen:scaleBySize(8),
+                            callback=function()
+                                showCard(next_idx)
+                            end,
+                        },
+                    },
+                },
+            }
+        end
+
+        -- Assemble
+        local content = VerticalGroup:new{ overlap=false,
+            -- Header
+            OverlapGroup:new{
+                dimen=Geom:new{w=inner_w, h=Screen:scaleBySize(26)},
+                allow_mirroring=false,
+                CenterContainer:new{
+                    dimen=Geom:new{w=inner_w, h=Screen:scaleBySize(26)},
+                    TextWidget:new{
+                        text=nice_date, face=date_face, bold=true,
+                        fgcolor=Blitbuffer.COLOR_BLACK,
+                    },
+                },
+                RightContainer:new{
+                    dimen=Geom:new{w=inner_w, h=Screen:scaleBySize(26)},
+                    TextWidget:new{
+                        text="✕", face=x_face, bold=true,
+                        fgcolor=Blitbuffer.COLOR_BLACK,
+                    },
+                },
+            },
+            VerticalSpan:new{height=Screen:scaleBySize(8)},
+            LineWidget:new{
+                background=Blitbuffer.COLOR_BLACK, line_width=1,
+                dimen=Geom:new{w=inner_w, h=1},
+            },
+            CenterContainer:new{
+                dimen=Geom:new{w=inner_w, h=COVER_H + Screen:scaleBySize(32)},
+                top_row,
+            },
+            LineWidget:new{
+                background=Blitbuffer.COLOR_LIGHT_GRAY, line_width=1,
+                dimen=Geom:new{w=inner_w, h=1},
+            },
+            CenterContainer:new{
+                dimen=Geom:new{w=inner_w, h=SEP_H + Screen:scaleBySize(20)},
+                stats_row,
+            },
+        }
+
+        if nav_row then
+            table.insert(content, LineWidget:new{
+                background=Blitbuffer.COLOR_LIGHT_GRAY, line_width=1,
+                dimen=Geom:new{w=inner_w, h=1},
+            })
+            table.insert(content, nav_row)
+        else
+            table.insert(content, VerticalSpan:new{height=Screen:scaleBySize(6)})
+        end
+
+        return FrameContainer:new{
+            padding=POPUP_PAD, bordersize=2,
+            radius=Screen:scaleBySize(12),
+            background=Blitbuffer.COLOR_WHITE,
+            content,
+        }
+    end
+
+    local current_idx = 1
+    local overlay
+
+    showCard = function(idx)
+        if overlay then UIManager:close(overlay, "ui") end
+
+        local popup = buildCard(idx)
+
+        overlay = InputContainer:new{
+            dimen = Geom:new{x=0, y=0, w=SW, h=SH},
+            CenterContainer:new{
+                dimen=Geom:new{w=SW, h=SH},
+                popup,
+            },
+        }
+
+        overlay:registerTouchZones({
+            {
+                id = "cc_popup_tap",
+                ges = "tap",
+                screen_zone = {
+                    ratio_x=0, ratio_y=0,
+                    ratio_w=1, ratio_h=1,
+                },
+                handler = function(_ges)
+                    UIManager:close(overlay, "ui")
+                    return true
+                end,
+            },
+        })
+
+        function overlay:onShow()
+            UIManager:setDirty(self, "ui")
+        end
+
+        UIManager:show(overlay)
+    end
+
+    showCard(1)
     return true
 end
 
 -- ── Main calendar view ────────────────────────────────────────────────────────
 local CoverCalendarView = InputContainer:extend{
     db_path       = "",
-    show_title    = false,
     start_dow     = 2,
     year          = 0,
     month         = 0,
     cover_size    = "compact",
     stack_covers  = true,
     month_summary = false,
+    cell_time     = false,
     today_color_id  = "none",
-    streak_color_id = "none",
-    stat_toggles  = nil,   -- {hours=bool, daily_avg=bool, pages=bool, days_active=bool, current_streak=bool, longest_streak=bool}
+    stat_toggles  = nil,
 }
 
 function CoverCalendarView:init()
@@ -526,12 +1080,7 @@ function CoverCalendarView:init()
     self.month   = (self.month ~= 0) and self.month or now.month
     self._today  = now
     self.stat_toggles = self.stat_toggles or {}
-    CoverUtil.resetDebugLog()
     self._title_path_map = CoverUtil.buildTitlePathMap()
-    if not CoverUtil.simpleUIAvailable() then
-        logger.warn("CoverCalendar: SimpleUI's module_books_shared not found — "
-            .. "covers will fall back to title placeholders")
-    end
 
     self.ges_events = {
         Swipe = {
@@ -542,7 +1091,30 @@ function CoverCalendarView:init()
             }
         },
     }
-    self:_build()
+
+    -- Two-phase loading strategy:
+    -- On the FIRST open (cold cache): show a skeleton immediately so the
+    -- screen isn't black while BookInfoManager opens EPUBs, then load
+    -- covers after the skeleton paints.
+    -- On SUBSEQUENT navigations: BookInfoManager's SQLite cache makes
+    -- cover loading near-instant, so we just do one build with covers
+    -- directly — no skeleton pass, no double refresh, no flash.
+    self._covers_loaded = false
+    if CoverUtil.isCoverCacheWarm and CoverUtil.isCoverCacheWarm() then
+        -- Cache is warm — covers load fast, build once directly
+        self._covers_loaded = true
+        self:_build()
+    else
+        -- Cold cache — show skeleton first, then covers after repaint
+        self:_build()
+        local self_ref = self
+        UIManager:tickAfterNext(function()
+            if self_ref._covers_loaded == false then
+                self_ref._covers_loaded = true
+                self_ref:_build()
+            end
+        end)
+    end
 end
 
 function CoverCalendarView:_build()
@@ -571,12 +1143,14 @@ function CoverCalendarView:_build()
                 callback=function() self:_prevMonth() end,
             },
         },
-        -- month+year centred
+        -- month+year centred — tappable to open month/year picker
         CenterContainer:new{
             dimen=Geom:new{w=SW, h=HDR_H},
-            TextWidget:new{
+            Button:new{
                 text=month_names[self.month].." "..self.year,
+                bordersize=0,
                 face=Font:getFace("cfont", MONTH_SIZE),
+                callback=function() self:_pickMonthYear() end,
             },
         },
         -- next (right of centre)
@@ -707,43 +1281,14 @@ function CoverCalendarView:_build()
         local avg_secs = (days_with_reading > 0) and (total_secs / days_with_reading) or 0
         local avg_mins = math.floor(avg_secs / 60)
 
-        -- Current streak / longest streak — derived from streak_days
-        -- (computed earlier for cell shading), which is scoped to the
-        -- displayed month only. "Current streak" here means the run
-        -- ending on the LAST day of the month that has reading data (not
-        -- necessarily today, if viewing a past month); it will under-count
-        -- streaks that started in the previous month since we don't query
-        -- across month boundaries.
-        local longest_streak = 0
-        local current_streak = 0
-        do
-            local run = 0
-            local last_active_day = nil
-            for d = 1, days_in_m do
-                local ds = string.format("%04d-%02d-%02d", self.year, self.month, d)
-                local active = (data[ds] ~= nil and #data[ds] > 0)
-                if active then
-                    run = run + 1
-                    last_active_day = d
-                    if run > longest_streak then longest_streak = run end
-                else
-                    run = 0
-                end
-            end
-            -- Current streak: the run ending at the most recent active day.
-            if last_active_day then
-                local run2 = 0
-                for d = last_active_day, 1, -1 do
-                    local ds = string.format("%04d-%02d-%02d", self.year, self.month, d)
-                    if data[ds] ~= nil and #data[ds] > 0 then
-                        run2 = run2 + 1
-                    else
-                        break
-                    end
-                end
-                current_streak = run2
-            end
-        end
+        -- All-time streaks: query the full stats DB history rather than
+        -- limiting to the displayed month (the old approach), so streaks
+        -- that cross month boundaries are counted correctly.
+        local all_streaks = (toggles.current_streak or toggles.longest_streak)
+            and loadAllTimeStreaks(self.db_path)
+            or { current = 0, longest = 0 }
+        local current_streak = all_streaks.current
+        local longest_streak = all_streaks.longest
 
         -- Build the summary line from only the toggled-on pieces, joined
         -- with a middle dot, so the user controls exactly what shows.
@@ -772,12 +1317,14 @@ function CoverCalendarView:_build()
 
         if #parts > 0 then
             local summary_text = table.concat(parts, "  ·  ")
-            SUMMARY_H = Screen:scaleBySize(24)
+            local SUMMARY_FONT = DOW_SIZE + 3  -- noticeably larger than weekday labels
+            SUMMARY_H = Screen:scaleBySize(28)
             summary_row = CenterContainer:new{
                 dimen = Geom:new{w=SW, h=SUMMARY_H},
                 TextWidget:new{
                     text = summary_text,
-                    face = Font:getFace("cfont", DOW_SIZE),
+                    face = Font:getFace("cfont", SUMMARY_FONT),
+                    bold = true,
                     fgcolor = Blitbuffer.COLOR_BLACK,
                 },
             }
@@ -796,17 +1343,29 @@ function CoverCalendarView:_build()
     local cur_day = 1
 
     for row = 1, n_rows do
-        local hrow = HorizontalGroup:new{overlap=false}
+        -- Use OverlapGroup instead of HorizontalGroup so each cell is
+        -- placed at an explicit pixel x-offset rather than relying on
+        -- HorizontalGroup summing children's getSize() results. That
+        -- summation fails when children report wrong sizes (the root
+        -- cause of partial rows centering in the middle of the screen),
+        -- because HorizontalGroup centres or left-aligns based on whatever
+        -- total width the children report, not on SW. With OverlapGroup +
+        -- overlap_offset we know exactly where each cell lands regardless
+        -- of what any child's getSize() returns.
+        local hrow = OverlapGroup:new{
+            dimen = Geom:new{w=SW, h=cell_h},
+            allow_mirroring = false,
+        }
 
+        local x_offset = 0
         for col = 0, 6 do
             local w = (col == 6) and last_w or cell_w
-            -- Is this cell before day 1 of the month?
             local is_prefix = (row == 1 and col < first_col)
-            -- Have we passed the last day?
             local is_overflow = (cur_day > days_in_m)
 
+            local child
             if is_prefix or is_overflow then
-                table.insert(hrow, makeEmptyCell(w, cell_h))
+                child = makeEmptyCell(w, cell_h)
             else
                 local ds    = string.format("%04d-%02d-%02d",
                     self.year, self.month, cur_day)
@@ -815,56 +1374,34 @@ function CoverCalendarView:_build()
                     and self.month == self._today.month
                     and cur_day    == self._today.day)
 
-                table.insert(hrow, DayCell:new{
+                child = DayCell:new{
                     width      = w,
                     height     = cell_h,
                     day        = cur_day,
                     day_str    = ds,
                     books      = books,
                     title_path_map = self._title_path_map,
-                    show_title = self.show_title,
                     is_today   = today,
                     cover_size   = self.cover_size,
                     stack_covers = self.stack_covers,
                     in_streak    = streak_days[cur_day] or false,
                     today_color_id  = self.today_color_id,
-                    streak_color_id = self.streak_color_id,
-                })
+                    skip_covers  = not self._covers_loaded,
+                    cell_time    = self.cell_time,
+                }
                 cur_day = cur_day + 1
             end
+
+            -- overlap_offset positions this child at an absolute x within
+            -- the OverlapGroup — this is the only reliable way to pin
+            -- cells to exact pixel positions regardless of their reported
+            -- getSize() width.
+            child.overlap_offset = {x_offset, 0}
+            table.insert(hrow, child)
+            x_offset = x_offset + w
         end
 
-        -- IMPORTANT: explicitly force this row to occupy the FULL screen
-        -- width via a fixed-dimen wrapper, rather than trusting
-        -- HorizontalGroup to auto-size to exactly SW from its children's
-        -- measured widths. This is the same "force a dimen" pattern used
-        -- throughout KOReader's own core widgets (e.g. WidgetContainer
-        -- wrappers with an explicit Geom dimen in screensaver.lua,
-        -- menu.lua) specifically to avoid auto-sizing ambiguity. Without
-        -- this, a row whose total measured width came out even slightly
-        -- under SW (for any reason — rounding, a child not honoring its
-        -- declared width, etc.) could end up centered or left-shifted by
-        -- whatever the parent VerticalGroup's default behavior is, which
-        -- is exactly the inconsistent centering bug being chased here.
-        local hrow_fixed = WidgetContainer:new{
-            dimen = Geom:new{x=0, y=0, w=SW, h=cell_h},
-            hrow,
-        }
-        table.insert(grid, hrow_fixed)
-
-        -- DIAGNOSTIC: log the row's actual measured size vs the expected
-        -- screen width, so the next debug log tells us ground truth
-        -- instead of another guess about HorizontalGroup/VerticalGroup
-        -- auto-sizing behavior.
-        local ok_size, hrow_size = pcall(function() return hrow:getSize() end)
-        local ok_size2, hrow_fixed_size = pcall(function() return hrow_fixed:getSize() end)
-        logger.info("CoverCalendar: row", row, "of", n_rows,
-            "raw hrow size:", ok_size and (hrow_size.w .. "x" .. hrow_size.h) or "ERR",
-            "wrapped size:", ok_size2 and (hrow_fixed_size.w .. "x" .. hrow_fixed_size.h) or "ERR",
-            "expected SW:", SW)
-        -- No row separator: rounded, self-bordered cells already read as
-        -- distinct cards, and a full-width line behind them produced a
-        -- visible "ghost grid" effect cutting across the rounded corners.
+        table.insert(grid, hrow)
     end
 
     -- ── Assemble full screen ──────────────────────────────────────────────────
@@ -894,18 +1431,108 @@ function CoverCalendarView:_build()
         VerticalGroup:new(vgroup_children),
     }
 
-    UIManager:setDirty(self, "partial")
+    -- "full" on skeleton pass so e-ink redraws before cover loading starts.
+    -- "ui" on the covers pass — faster, less visible flash than "partial".
+    if not self._covers_loaded then
+        UIManager:setDirty(self, "full")
+    else
+        UIManager:setDirty(self, "ui")
+    end
 end
 
+function CoverCalendarView:_pickMonthYear()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local self_ref = self
+    local pick_year = self.year
+
+    -- Month name list matches the header
+    local month_short = {
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec",
+    }
+
+    local function buildDialog()
+        local buttons = {}
+        -- Row 1-3: months in a 4-column grid
+        for row = 0, 2 do
+            local r = {}
+            for col = 1, 4 do
+                local m = row * 4 + col
+                table.insert(r, {
+                    text = (m == self_ref.month and "["..month_short[m].."]" or month_short[m]),
+                    callback = function()
+                        UIManager:close(self_ref._month_picker)
+                        self_ref._month_picker = nil
+                        CoverUtil.clearCoverCache()
+                        self_ref.month = m
+                        self_ref.year = pick_year
+                        self_ref._covers_loaded = true
+                        self_ref:_build()
+                    end,
+                })
+            end
+            table.insert(buttons, r)
+        end
+        -- Year row: prev year | year label | next year
+        table.insert(buttons, {
+            {
+                text = "‹ " .. (pick_year - 1),
+                callback = function()
+                    pick_year = pick_year - 1
+                    UIManager:close(self_ref._month_picker)
+                    self_ref._month_picker = nil
+                    UIManager:scheduleIn(0.05, function()
+                        self_ref._month_picker = buildDialog()
+                        UIManager:show(self_ref._month_picker)
+                    end)
+                end,
+            },
+            {
+                text = tostring(pick_year),
+                callback = function() end,  -- label only, no action
+            },
+            {
+                text = (pick_year + 1) .. " ›",
+                callback = function()
+                    pick_year = pick_year + 1
+                    UIManager:close(self_ref._month_picker)
+                    self_ref._month_picker = nil
+                    UIManager:scheduleIn(0.05, function()
+                        self_ref._month_picker = buildDialog()
+                        UIManager:show(self_ref._month_picker)
+                    end)
+                end,
+            },
+        })
+
+        return ButtonDialog:new{
+            title = _("Go to month"),
+            buttons = buttons,
+        }
+    end
+
+    self._month_picker = buildDialog()
+    UIManager:show(self._month_picker)
+end
+
+
 function CoverCalendarView:_prevMonth()
+    CoverUtil.clearCoverCache()
     self.month = self.month - 1
     if self.month < 1 then self.month=12; self.year=self.year-1 end
+    -- After first open, BookInfoManager's SQLite cache makes cover loading
+    -- near-instant. Do a single direct build — no skeleton pass, no double
+    -- refresh, no flash. The two-phase skeleton approach is only needed
+    -- on the very first cold open (handled in init()).
+    self._covers_loaded = true
     self:_build()
 end
 
 function CoverCalendarView:_nextMonth()
+    CoverUtil.clearCoverCache()
     self.month = self.month + 1
     if self.month > 12 then self.month=1; self.year=self.year+1 end
+    self._covers_loaded = true
     self:_build()
 end
 
@@ -915,12 +1542,12 @@ function CoverCalendarView:onSwipe(_, ges)
 end
 
 function CoverCalendarView:onClose()
-    -- IMPORTANT: UIManager:close() alone doesn't guarantee an e-ink
-    -- refresh happens — it only enqueues one if other dirty widgets are
-    -- still on the stack. Passing "full" here forces the screen to
-    -- actually repaint immediately, instead of leaving the stale
-    -- calendar image on screen until some unrelated UI event (like
-    -- tapping the status bar) happens to trigger a refresh.
+    -- Mark covers as loaded so any pending scheduled rebuild doesn't fire
+    -- after the view has been closed and freed.
+    self._covers_loaded = true
+    -- Free the cover cache immediately on close so BlitBuffer C memory
+    -- is released back to the OS rather than waiting for Lua GC.
+    CoverUtil.clearCoverCache()
     UIManager:close(self, "full")
 end
 

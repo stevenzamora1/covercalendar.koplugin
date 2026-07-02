@@ -4,7 +4,6 @@
     by a mini cover image instead of a coloured title bar.
 
     Settings (stored in G_reader_settings):
-        covercalendar_show_title  (bool)  – show title text below each cover
         covercalendar_start_dow   (int)   – 1=Sun … 7=Sat  (default 2 = Mon)
 
     Accessible via:  Menu → Tools → Cover Calendar
@@ -67,46 +66,11 @@ function CoverCalendar:addToMainMenu(menu_items)
                 end,
             },
             {
-                text_func = function()
-                    local on = G_reader_settings:isTrue("covercalendar_show_title")
-                    return on and _("Show title: ON") or _("Show title: OFF")
-                end,
-                callback = function(touchmenu_instance)
-                    local current = G_reader_settings:isTrue("covercalendar_show_title")
-                    G_reader_settings:saveSetting("covercalendar_show_title", not current)
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-                keep_menu_open = true,
-            },
-            {
-                text = _("Week starts on Monday"),
-                checked_func = function()
-                    local dow = G_reader_settings:readSetting("covercalendar_start_dow") or 2
-                    return dow == 2
-                end,
-                callback = function(touchmenu_instance)
-                    G_reader_settings:saveSetting("covercalendar_start_dow", 2)
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-                keep_menu_open = true,
-            },
-            {
-                text = _("Week starts on Sunday"),
-                checked_func = function()
-                    local dow = G_reader_settings:readSetting("covercalendar_start_dow") or 2
-                    return dow == 1
-                end,
-                callback = function(touchmenu_instance)
-                    G_reader_settings:saveSetting("covercalendar_start_dow", 1)
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-                keep_menu_open = true,
-            },
-            {
-                text = _("Cover size"),
+                text = _("Calendar style"),
                 sub_item_table = {
+                    -- ── Cover size ───────────────────────────────────────
                     {
-                        text = _("Compact (default)"),
+                        text = _("Cover size: Compact"),
                         checked_func = function()
                             return (G_reader_settings:readSetting("covercalendar_cover_size") or "compact") == "compact"
                         end,
@@ -117,7 +81,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Cozy"),
+                        text = _("Cover size: Cozy"),
                         checked_func = function()
                             return (G_reader_settings:readSetting("covercalendar_cover_size") or "compact") == "cozy"
                         end,
@@ -126,37 +90,38 @@ function CoverCalendar:addToMainMenu(menu_items)
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                         keep_menu_open = true,
+                        separator = true,
                     },
+                    -- ── Stacked covers ───────────────────────────────────
                     {
-                        text = _("Large"),
-                        checked_func = function()
-                            return (G_reader_settings:readSetting("covercalendar_cover_size") or "compact") == "large"
+                        text_func = function()
+                            local on = G_reader_settings:nilOrTrue("covercalendar_stack_covers")
+                            return on and _("Stacked covers: ON") or _("Stacked covers: OFF")
                         end,
                         callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_cover_size", "large")
+                            local current = G_reader_settings:nilOrTrue("covercalendar_stack_covers")
+                            G_reader_settings:saveSetting("covercalendar_stack_covers", not current)
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                         keep_menu_open = true,
                     },
-                },
-            },
-            {
-                text_func = function()
-                    local on = G_reader_settings:nilOrTrue("covercalendar_stack_covers")
-                    return on and _("Stacked covers for multi-book days: ON") or _("Stacked covers for multi-book days: OFF")
-                end,
-                callback = function(touchmenu_instance)
-                    local current = G_reader_settings:nilOrTrue("covercalendar_stack_covers")
-                    G_reader_settings:saveSetting("covercalendar_stack_covers", not current)
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-                keep_menu_open = true,
-            },
-            {
-                text = _("Today's cell color"),
-                sub_item_table = {
+                    -- ── Reading time on cells ────────────────────────────
                     {
-                        text = _("None (default)"),
+                        text_func = function()
+                            local on = G_reader_settings:isTrue("covercalendar_cell_time")
+                            return on and _("Reading time on cells: ON") or _("Reading time on cells: OFF")
+                        end,
+                        callback = function(touchmenu_instance)
+                            local current = G_reader_settings:isTrue("covercalendar_cell_time")
+                            G_reader_settings:saveSetting("covercalendar_cell_time", not current)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                        keep_menu_open = true,
+                        separator = true,
+                    },
+                    -- ── Today's cell color ───────────────────────────────
+                    {
+                        text = _("Today color: None"),
                         checked_func = function()
                             return (G_reader_settings:readSetting("covercalendar_today_color") or "none") == "none"
                         end,
@@ -167,7 +132,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Light orange"),
+                        text = _("Today color: Orange"),
                         checked_func = function()
                             return G_reader_settings:readSetting("covercalendar_today_color") == "orange"
                         end,
@@ -178,7 +143,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Light red"),
+                        text = _("Today color: Red"),
                         checked_func = function()
                             return G_reader_settings:readSetting("covercalendar_today_color") == "red"
                         end,
@@ -189,7 +154,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Light blue"),
+                        text = _("Today color: Blue"),
                         checked_func = function()
                             return G_reader_settings:readSetting("covercalendar_today_color") == "blue"
                         end,
@@ -200,7 +165,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Light green"),
+                        text = _("Today color: Green"),
                         checked_func = function()
                             return G_reader_settings:readSetting("covercalendar_today_color") == "green"
                         end,
@@ -211,7 +176,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                         keep_menu_open = true,
                     },
                     {
-                        text = _("Light gray"),
+                        text = _("Today color: Gray"),
                         checked_func = function()
                             return G_reader_settings:readSetting("covercalendar_today_color") == "gray"
                         end,
@@ -220,77 +185,7 @@ function CoverCalendar:addToMainMenu(menu_items)
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                         keep_menu_open = true,
-                    },
-                },
-            },
-            {
-                text = _("Streak day cell color"),
-                sub_item_table = {
-                    {
-                        text = _("None (default)"),
-                        checked_func = function()
-                            return (G_reader_settings:readSetting("covercalendar_streak_color") or "none") == "none"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "none")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Light orange"),
-                        checked_func = function()
-                            return G_reader_settings:readSetting("covercalendar_streak_color") == "orange"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "orange")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Light red"),
-                        checked_func = function()
-                            return G_reader_settings:readSetting("covercalendar_streak_color") == "red"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "red")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Light blue"),
-                        checked_func = function()
-                            return G_reader_settings:readSetting("covercalendar_streak_color") == "blue"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "blue")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Light green"),
-                        checked_func = function()
-                            return G_reader_settings:readSetting("covercalendar_streak_color") == "green"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "green")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Light gray"),
-                        checked_func = function()
-                            return G_reader_settings:readSetting("covercalendar_streak_color") == "gray"
-                        end,
-                        callback = function(touchmenu_instance)
-                            G_reader_settings:saveSetting("covercalendar_streak_color", "gray")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                        keep_menu_open = true,
+                        separator = true,
                     },
                 },
             },
@@ -385,43 +280,31 @@ function CoverCalendar:addToMainMenu(menu_items)
                 },
             },
             {
-                text = _("View debug log"),
-                keep_menu_open = true,
-                callback = function()
-                    self:showDebugLog()
+                text = _("Week starts on Monday"),
+                checked_func = function()
+                    local dow = G_reader_settings:readSetting("covercalendar_start_dow") or 2
+                    return dow == 2
                 end,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:saveSetting("covercalendar_start_dow", 2)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                keep_menu_open = true,
+            },
+            {
+                text = _("Week starts on Sunday"),
+                checked_func = function()
+                    local dow = G_reader_settings:readSetting("covercalendar_start_dow") or 2
+                    return dow == 1
+                end,
+                callback = function(touchmenu_instance)
+                    G_reader_settings:saveSetting("covercalendar_start_dow", 1)
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                keep_menu_open = true,
             },
         },
     }
-end
-
--- ── Debug log viewer ──────────────────────────────────────────────────────────
-
-function CoverCalendar:showDebugLog()
-    local CoverUtil = require("coverutil")
-    local path = CoverUtil.getDebugLogPath()
-    local lfs = require("libs/libkoreader-lfs")
-    if not lfs.attributes(path, "mode") then
-        UIManager:show(InfoMessage:new{
-            text = _("No debug log yet. Open the calendar first, then check this again."),
-        })
-        return
-    end
-
-    local f = io.open(path, "r")
-    local content = f and f:read("*a") or "(could not read log)"
-    if f then f:close() end
-
-    -- Truncate to last ~4000 chars so it's readable on an e-ink screen
-    if #content > 4000 then
-        content = "...(truncated)...\n" .. content:sub(-4000)
-    end
-
-    local TextViewer = require("ui/widget/textviewer")
-    UIManager:show(TextViewer:new{
-        title = _("Cover Calendar Debug Log"),
-        text  = content,
-    })
 end
 
 -- ── Open the calendar ─────────────────────────────────────────────────────────
@@ -437,13 +320,12 @@ function CoverCalendar:openCalendar()
         return
     end
 
-    local show_title    = G_reader_settings:isTrue("covercalendar_show_title")
     local start_dow     = G_reader_settings:readSetting("covercalendar_start_dow") or 2
     local cover_size    = G_reader_settings:readSetting("covercalendar_cover_size") or "compact"
     local stack_covers  = G_reader_settings:nilOrTrue("covercalendar_stack_covers")
     local month_summary = G_reader_settings:isTrue("covercalendar_month_summary")
+    local cell_time     = G_reader_settings:isTrue("covercalendar_cell_time")
     local today_color_id  = G_reader_settings:readSetting("covercalendar_today_color") or "none"
-    local streak_color_id = G_reader_settings:readSetting("covercalendar_streak_color") or "none"
 
     local stat_toggles = {
         hours       = G_reader_settings:nilOrTrue("covercalendar_stat_hours"),
@@ -454,23 +336,14 @@ function CoverCalendar:openCalendar()
         longest_streak = G_reader_settings:nilOrTrue("covercalendar_stat_longest_streak"),
     }
 
-    local CoverUtil = require("coverutil")
-    if not CoverUtil.simpleUIAvailable() then
-        UIManager:show(InfoMessage:new{
-            text = _("SimpleUI's cover module wasn't found, so book covers will show as title placeholders instead.\n\nMake sure SimpleUI is installed and enabled, then restart KOReader."),
-            timeout = 6,
-        })
-    end
-
     local view = CoverCalendarView:new{
         db_path       = db_path,
-        show_title    = show_title,
         start_dow     = start_dow,
         cover_size    = cover_size,
         stack_covers  = stack_covers,
         month_summary = month_summary,
+        cell_time     = cell_time,
         today_color_id  = today_color_id,
-        streak_color_id = streak_color_id,
         stat_toggles  = stat_toggles,
     }
     UIManager:show(view)
