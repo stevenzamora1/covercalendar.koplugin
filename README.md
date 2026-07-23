@@ -7,7 +7,7 @@ Compatible with SimpleUI — the plugin registers as a Quick Action
 ## Features
 
 ### Monthly calendar
-* A flat, cover-first
+* A flat, cover-first, calendar design  fully Inspired by u/ReadinGadgets
 * Tap any day to see book details: title, author, series, reading time, pages read, and progress percentage
 * If you read multiple books in one day, use the arrow buttons in the popup to browse between them
 * Optional reading time badge on each cell
