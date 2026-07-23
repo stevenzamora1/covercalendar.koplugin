@@ -93,7 +93,6 @@ end
 
 -- ── Native cover extraction via BookInfoManager ───────────────────────────────
 
-local _cover_cache = {}
 local _cache_warm = false
 local _BIM = nil
 
@@ -104,13 +103,17 @@ local function getBIM()
     return _BIM
 end
 
+-- Retained for API compatibility but now a NO-OP: cover widgets are no
+-- longer shared between views. Each getCoverWidget() call returns a FRESH
+-- ImageWidget owned solely by the widget tree it is inserted into, so
+-- UIManager freeing a closed view's tree can never corrupt covers painted
+-- elsewhere — which was the bug producing garbled noise blocks when
+-- reopening the year view or returning from a day popup: the shared cached
+-- widgets' internal buffers were freed along with the closed view's tree,
+-- then repainted. The expensive part (decoding covers out of the books) is
+-- already cached by BookInfoManager in its own SQLite DB, so per-view
+-- widget creation stays cheap.
 function CoverUtil.clearCoverCache()
-    for _, widget in pairs(_cover_cache) do
-        if widget and widget.free then
-            pcall(widget.free, widget)
-        end
-    end
-    _cover_cache = {}
 end
 
 function CoverUtil.isCoverCacheWarm()
@@ -119,9 +122,6 @@ end
 
 function CoverUtil.getCoverWidget(path, w, h)
     if not path or path == "" then return nil end
-
-    local cache_key = path .. ":" .. w .. "x" .. h
-    if _cover_cache[cache_key] then return _cover_cache[cache_key] end
 
     local BIM = getBIM()
     if not BIM then return nil end
@@ -143,14 +143,96 @@ function CoverUtil.getCoverWidget(path, w, h)
     local ok_iw, ImageWidget = pcall(require, "ui/widget/imagewidget")
     if not ok_iw then return nil end
 
+    -- image_disposable=false is the load-bearing part: the source
+    -- blitbuffer belongs to BookInfoManager and may be shared by other
+    -- simultaneously-alive widgets (monthly grid under the year view).
+    -- The widget's own scaled buffer is per-widget and freed with its view.
     local ok_w, widget = pcall(ImageWidget.new, ImageWidget, {
-        image=bookinfo.cover_bb, scale_factor=sf,
+        image = bookinfo.cover_bb,
+        scale_factor = sf,
+        image_disposable = false,
     })
     if not ok_w or not widget then return nil end
 
     _cache_warm = true
-    _cover_cache[cache_key] = widget
     return widget
+end
+
+-- ── Finished-book detection (shared: monthly stats + yearly overview) ────────
+CoverUtil.FINISH_PERCENT   = 0.95  -- endnotes/back matter often leave ~3-5%
+CoverUtil.MEANINGFUL_SECS  = 300   -- a session counts toward a finish date
+CoverUtil.MEANINGFUL_PAGES = 5     -- only if ≥5 min or ≥5 distinct pages
+
+local function readSidecar(path)
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not ok_ds or not DocSettings then return nil end
+    local ok_sd, sidecar = pcall(DocSettings.open, DocSettings, path)
+    if not ok_sd or not sidecar then return nil end
+    local out = {}
+    local ok_sum, summary = pcall(sidecar.readSetting, sidecar, "summary")
+    if ok_sum and type(summary) == "table" then
+        out.status = summary.status
+        if type(summary.modified) == "string" then
+            out.modified = summary.modified:match("^(%d%d%d%d%-%d%d%-%d%d)")
+        end
+    end
+    local ok_pf, pf = pcall(sidecar.readSetting, sidecar, "percent_finished")
+    if ok_pf and type(pf) == "number" then out.percent = pf end
+    return out
+end
+
+-- bk: {title=..., pages=..., total_read_pages=...}
+-- Returns: finished (bool), path (string|nil), sidecar_date ("YYYY-MM-DD"|nil)
+function CoverUtil.getFinishedInfo(title_path_map, bk)
+    local path = title_path_map
+        and CoverUtil.findPathForTitle(title_path_map, bk.title)
+    local sc = path and readSidecar(path) or nil
+    if sc then
+        if sc.status == "complete" then
+            return true, path, sc.modified
+        end
+        if sc.status ~= "abandoned"
+           and sc.percent and sc.percent >= CoverUtil.FINISH_PERCENT then
+            return true, path, nil
+        end
+    end
+    -- DB fallback — also covers books whose files were deleted
+    if bk.pages and bk.pages > 0 and bk.total_read_pages
+       and bk.total_read_pages >= bk.pages * CoverUtil.FINISH_PERCENT then
+        return true, path, nil
+    end
+    return false, path, nil
+end
+
+-- sessions: ascending array of {ds="YYYY-MM-DD", dur=secs, pages_today=n}
+-- restricted to the period of interest; range bounds are inclusive ISO dates
+-- (ISO dates compare correctly as plain strings).
+-- Returns: finished_ds ("YYYY-MM-DD"|nil), path
+--
+-- A finished book is credited to a period by:
+--   1. its sidecar completion date (summary.modified) when inside the range.
+--      If a sidecar date exists but falls OUTSIDE the range, the book is NOT
+--      credited to this period at all — reopening a long-finished book to
+--      check a quote must not re-file it into the current month/year.
+--   2. otherwise, the last MEANINGFUL session in range — trivial peeks
+--      (under 5 min AND under 5 pages) never set a finish date either.
+function CoverUtil.finishedDateInRange(title_path_map, bk, sessions, range_start, range_end)
+    local finished, path, sd = CoverUtil.getFinishedInfo(title_path_map, bk)
+    if not finished then return nil, path end
+    if sd then
+        if sd >= range_start and sd <= range_end then
+            return sd, path
+        end
+        return nil, path
+    end
+    for i = #sessions, 1, -1 do
+        local s = sessions[i]
+        if (s.dur or 0) >= CoverUtil.MEANINGFUL_SECS
+           or (s.pages_today or 0) >= CoverUtil.MEANINGFUL_PAGES then
+            return s.ds, path
+        end
+    end
+    return nil, path
 end
 
 -- ── Color presets ─────────────────────────────────────────────────────────────
