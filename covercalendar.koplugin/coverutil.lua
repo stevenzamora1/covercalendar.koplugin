@@ -127,7 +127,34 @@ function CoverUtil.getCoverWidget(path, w, h)
     if not BIM then return nil end
 
     local ok, bookinfo = pcall(BIM.getBookInfo, BIM, path, true)
-    if not ok or not bookinfo or not bookinfo.cover_bb then return nil end
+    if not ok then return nil end
+
+    -- BookInfoManager is a CACHE: it only has covers for books it has been
+    -- asked to extract, which normally happens when the file browser shows
+    -- them in cover/mosaic view. Users who browse in list view (no
+    -- CoverBrowser/SimpleUI) may have most of their library unextracted, so
+    -- when a book has never been seen, extract it ourselves — once. The
+    -- result is persisted in BIM's SQLite DB, so this costs a moment on
+    -- first display and nothing afterwards. If a book WAS extracted and
+    -- genuinely has no embedded cover (has_cover unset), don't retry.
+    if not bookinfo then
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if not ok_lfs or lfs.attributes(path, "mode") ~= "file" then
+            return nil   -- book deleted; nothing to extract
+        end
+        local ok_d, Device = pcall(require, "device")
+        local sw = ok_d and Device.screen:getWidth() or 800
+        local sh = ok_d and Device.screen:getHeight() or 1200
+        pcall(BIM.extractBookInfo, BIM, path, {
+            sizetag = "covercalendar",
+            max_cover_w = sw,
+            max_cover_h = sh,
+        })
+        ok, bookinfo = pcall(BIM.getBookInfo, BIM, path, true)
+        if not ok then return nil end
+    end
+
+    if not bookinfo or not bookinfo.cover_bb then return nil end
 
     local sf
     local ok2, _, _, csf = pcall(

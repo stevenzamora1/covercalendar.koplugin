@@ -20,7 +20,7 @@ local _ = require("gettext")
 local CoverCalendarView = require("covercalendarview")
 local Updater = require("updater")
 
-local PLUGIN_VERSION = "2.0"
+local PLUGIN_VERSION = "2.0.1"
 
 local CoverCalendar = WidgetContainer:extend{
     name = "covercalendar",

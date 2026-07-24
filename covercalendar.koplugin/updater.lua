@@ -103,44 +103,71 @@ end
 -- ── HTTP ─────────────────────────────────────────────────────────────────────
 
 -- Returns body (string) or nil, err. GitHub requires a User-Agent header.
+--
+-- Redirects are followed MANUALLY here. LuaSec's ssl.https does not follow
+-- redirects at all — worse, it returns nil, "redirect not supported" if the
+-- request table even contains a `redirect` field — and GitHub's download
+-- URLs (release assets, zipballs) always redirect to
+-- objects.githubusercontent.com / codeload.github.com. So we issue the
+-- request, and on a 3xx re-issue it against the Location header, up to
+-- MAX_REDIRECTS hops, picking http vs https per hop.
+local MAX_REDIRECTS = 5
+
 local function httpGet(url, sink_to_file)
     local ok_h, http = pcall(require, "socket.http")
     local ok_s, https = pcall(require, "ssl.https")
     local ok_l, ltn12 = pcall(require, "ltn12")
     if not ok_l or not ltn12 then return nil, "ltn12 unavailable" end
 
-    local requester = (url:match("^https") and ok_s and https)
-        or (ok_h and http)
-    if not requester then return nil, "no http library" end
+    for _ = 0, MAX_REDIRECTS do
+        local requester = (url:match("^https") and ok_s and https)
+            or (ok_h and http)
+        if not requester then return nil, "no http library" end
 
-    local sink, body_tbl, fh
-    if sink_to_file then
-        local err
-        fh, err = io.open(sink_to_file, "wb")
-        if not fh then return nil, "cannot write " .. tostring(err) end
-        sink = ltn12.sink.file(fh)
-    else
-        body_tbl = {}
-        sink = ltn12.sink.table(body_tbl)
+        local sink, body_tbl, fh
+        if sink_to_file then
+            local err
+            fh, err = io.open(sink_to_file, "wb")
+            if not fh then return nil, "cannot write " .. tostring(err) end
+            sink = ltn12.sink.file(fh)   -- closes fh when the request ends
+        else
+            body_tbl = {}
+            sink = ltn12.sink.table(body_tbl)
+        end
+
+        local ok_req, code, headers = pcall(function()
+            local _, c, h = requester.request{
+                url = url,
+                headers = {
+                    ["User-Agent"] = "KOReader-CoverCalendar",
+                    ["Accept"] = "application/vnd.github+json",
+                },
+                sink = sink,
+            }
+            return c, h
+        end)
+
+        if not ok_req then return nil, "request failed: " .. tostring(code) end
+
+        if code == 301 or code == 302 or code == 303
+           or code == 307 or code == 308 then
+            local location = headers and (headers.location or headers.Location)
+            if not location then return nil, "redirect without location" end
+            -- Relative redirect: resolve against the current URL's host
+            if not location:match("^https?://") then
+                local base = url:match("^(https?://[^/]+)")
+                location = (base or "") .. location
+            end
+            url = location
+            -- loop: re-request against the new URL
+        elseif code ~= 200 then
+            return nil, "HTTP " .. tostring(code)
+        else
+            if sink_to_file then return true end
+            return table.concat(body_tbl)
+        end
     end
-
-    local ok_req, code = pcall(function()
-        local _, c = requester.request{
-            url = url,
-            headers = {
-                ["User-Agent"] = "KOReader-CoverCalendar",
-                ["Accept"] = "application/vnd.github+json",
-            },
-            sink = sink,
-            redirect = true,
-        }
-        return c
-    end)
-
-    if not ok_req then return nil, "request failed: " .. tostring(code) end
-    if code ~= 200 then return nil, "HTTP " .. tostring(code) end
-    if sink_to_file then return true end
-    return table.concat(body_tbl)
+    return nil, "too many redirects"
 end
 
 -- ── Release lookup ───────────────────────────────────────────────────────────
