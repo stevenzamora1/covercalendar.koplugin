@@ -37,8 +37,34 @@ function CoverUtil.buildTitlePathMap()
     return map
 end
 
+local function foldUnicode(s)
+    local replacements = {
+        {"Ä", "a"}, {"Ö", "o"}, {"Ü", "u"},
+        {"ä", "a"}, {"ö", "o"}, {"ü", "u"},
+        {"ß", "ss"}, {"ẞ", "ss"},
+        {"À", "a"}, {"Á", "a"}, {"Â", "a"}, {"Ã", "a"}, {"Å", "a"},
+        {"à", "a"}, {"á", "a"}, {"â", "a"}, {"ã", "a"}, {"å", "a"},
+        {"È", "e"}, {"É", "e"}, {"Ê", "e"}, {"Ë", "e"},
+        {"è", "e"}, {"é", "e"}, {"ê", "e"}, {"ë", "e"},
+        {"Ì", "i"}, {"Í", "i"}, {"Î", "i"}, {"Ï", "i"},
+        {"ì", "i"}, {"í", "i"}, {"î", "i"}, {"ï", "i"},
+        {"Ò", "o"}, {"Ó", "o"}, {"Ô", "o"}, {"Õ", "o"}, {"Ø", "o"},
+        {"ò", "o"}, {"ó", "o"}, {"ô", "o"}, {"õ", "o"}, {"ø", "o"},
+        {"Ù", "u"}, {"Ú", "u"}, {"Û", "u"},
+        {"ù", "u"}, {"ú", "u"}, {"û", "u"},
+        {"Ç", "c"}, {"ç", "c"}, {"Ñ", "n"}, {"ñ", "n"},
+        {"Ý", "y"}, {"Ÿ", "y"}, {"ý", "y"}, {"ÿ", "y"},
+        {"Æ", "ae"}, {"æ", "ae"}, {"Œ", "oe"}, {"œ", "oe"},
+    }
+    for _, pair in ipairs(replacements) do
+        s = s:gsub(pair[1], pair[2])
+    end
+    return s
+end
+
 local function normalize(s)
     if not s then return "" end
+    s = foldUnicode(s)
     s = s:gsub("%.%w+$", "")              -- drop file extension
     local before_dash = s:match("^(.-)%s%-%s[^%-]+$")
     local base = before_dash or s
