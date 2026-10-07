@@ -1,12 +1,18 @@
 --[[
-    covercalendarview.lua  (v4)
+    covercalendarview.lua  (v2.0.2)
 
-    Key fixes vs v3:
-      - Cover lookup now delegates to SimpleUI's module_books_shared.getBookCover()
-        (see coverutil.lua) since covers are embedded in the EPUBs themselves,
-        not stored as sidecar files
-      - DayCell takes a title->path map instead of title->cover-path map
-      - Grid layout unchanged (already correct from v3)
+    The monthly calendar: one cell per day, the cover of what was read that
+    day in place of the day number.
+
+    2.0.2:
+      - Covers: each book is passed to coverutil.lua together with its
+        author and file checksum, so it can be found even when the file name
+        looks nothing like the title. Covers that are not cached yet arrive
+        in the background and the grid repaints itself when they do.
+      - Header: the month arrows and the close button are now full-height
+        touch targets about 10 mm wide (they were about 4 mm).
+      - Devices with page-turn buttons can use them to change month, and
+        Back to close.
 --]]
 
 local Blitbuffer      = require("ffi/blitbuffer")
@@ -114,7 +120,8 @@ local function loadMonthData(db_path, year, month)
             COUNT(DISTINCT psd.page) AS pages_today,
             b.pages AS pages,
             b.total_read_pages AS total_read_pages,
-            MAX(psd.start_time) AS last_seen
+            MAX(psd.start_time) AS last_seen,
+            b.md5 AS md5
         FROM page_stat_data psd
         JOIN book b ON b.id = psd.id_book
         WHERE psd.start_time >= %d AND psd.start_time <= %d
@@ -122,22 +129,30 @@ local function loadMonthData(db_path, year, month)
         ORDER BY ds, dur DESC
     ]], t0, t1)
 
+    -- NOTE: exec() returns nil (without raising) when a query simply matches
+    -- no rows — a month with no reading. Only a raised error is a failure.
     local ok3, res = pcall(function() return conn:exec(sql) end)
-    if not ok3 or not res then
+    if not ok3 then
         logger.warn("CoverCalendar: query against page_stat_data failed:", tostring(res), "- trying page_stat view")
         local sql2 = sql:gsub("page_stat_data", "page_stat")
         ok3, res = pcall(function() return conn:exec(sql2) end)
     end
 
-    if not ok3 or not res then
+    if not ok3 then
         logger.warn("CoverCalendar: both stats queries failed:", tostring(res))
+        pcall(function() conn:close() end)
+        return result
+    end
+    if not res then
         pcall(function() conn:close() end)
         return result
     end
 
     -- res is column-major: res[1]=ds, res[2]=title, res[3]=authors, res[4]=series,
     -- res[5]=book_id, res[6]=dur, res[7]=pages_today, res[8]=pages,
-    -- res[9]=total_read_pages, res[10]=last_seen
+    -- res[9]=total_read_pages, res[10]=last_seen, res[11]=md5 (the book
+    -- file's partial checksum — the one identifier that also appears in the
+    -- book's sidecar, so coverutil can match the two exactly)
     local n_rows = res[1] and #res[1] or 0
     logger.info("CoverCalendar: loadMonthData got", n_rows, "rows for", year, month)
 
@@ -151,6 +166,7 @@ local function loadMonthData(db_path, year, month)
         local pages_today = tonumber(res[7] and res[7][i]) or 0
         local pages       = tonumber(res[8] and res[8][i]) or 0
         local total_read_pages = tonumber(res[9] and res[9][i]) or 0
+        local md5         = res[11] and res[11][i] or nil
         if not result[ds] then result[ds] = {} end
         table.insert(result[ds], {
             title       = title,
@@ -160,6 +176,7 @@ local function loadMonthData(db_path, year, month)
             pages_today = pages_today,
             pages       = pages,
             total_read_pages = total_read_pages,
+            md5         = (type(md5) == "string" and md5 ~= "") and md5 or nil,
         })
     end
 
@@ -301,7 +318,6 @@ function DayCell:init()
     local books = self.books or {}
 
     local num_face   = Font:getFace("cfont", DAY_NUM_SIZE)
-    local title_face = Font:getFace("cfont", TITLE_SIZE)
 
     -- ── Today tint (kept from the old design; default "none" = plain) ────────
     local has_color = Device:hasColorScreen() and
@@ -364,7 +380,8 @@ function DayCell:init()
         local cover_w = math.max(0, math.floor((W - PAD*2) * size_ratio))
 
         local function resolveCoverWidget(book, w, h)
-            local path = self.title_path_map and CoverUtil.findPathForTitle(self.title_path_map, book.title)
+            local path = self.title_path_map
+                and CoverUtil.findPathForTitle(self.title_path_map, book.title, book)
             if path then
                 local img = CoverUtil.getCoverWidget(path, w, h)
                 if img then
@@ -389,18 +406,15 @@ function DayCell:init()
                     }
                 end
             end
-            -- Fallback: abbreviated title chip when no cover can be found
-            local abbr = book.title:sub(1, math.floor(w / (TITLE_SIZE * 0.6)))
+            -- Fallback when there is no cover to draw (yet): a book-shaped
+            -- chip with the title wrapped inside it.
+            local chip_w = math.min(w, math.floor(h * 0.68))
             return FrameContainer:new{
-                padding=2, bordersize=1, radius=Screen:scaleBySize(3),
+                padding=0, bordersize=0,
                 width=w, height=h,
-                background=Blitbuffer.COLOR_LIGHT_GRAY,
                 CenterContainer:new{
-                    dimen=Geom:new{w=w-4, h=h-4},
-                    TextWidget:new{
-                        text=abbr, face=title_face,
-                        fgcolor=Blitbuffer.COLOR_BLACK,
-                    },
+                    dimen = Geom:new{w=w, h=h},
+                    CoverUtil.makeTitleChip(book.title, chip_w, h, {font_size=TITLE_SIZE}),
                 },
             }
         end
@@ -593,7 +607,7 @@ function DayCell:onTap()
             and tostring(book.pages_today) or "—"
 
         if self_cell.title_path_map then
-            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title)
+            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title, book)
             if path then
                 local ok_ds, DocSettings = pcall(require, "docsettings")
                 if ok_ds and DocSettings then
@@ -632,70 +646,32 @@ function DayCell:onTap()
             end
         end
 
-        -- Cover
+        -- Cover (same lookup + cache path as the grid cells)
         local cover_widget = nil
         if self_cell.title_path_map then
-            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title)
-            if path then
-                local ok_bim, BIM = pcall(require, "bookinfomanager")
-                if ok_bim and BIM then
-                    local ok_bi, bi = pcall(BIM.getBookInfo, BIM, path, true)
-                    if ok_bi and bi and bi.cover_bb then
-                        local sf
-                        local ok2, _, _, csf = pcall(
-                            BIM.getCachedCoverSize, BIM, bi.cover_w, bi.cover_h,
-                            COVER_W, COVER_H)
-                        if ok2 and csf then sf = csf else
-                            sf = math.min(COVER_W/(bi.cover_w or COVER_W),
-                                          COVER_H/(bi.cover_h or COVER_H))
-                        end
-                        local ok_iw, IW = pcall(require, "ui/widget/imagewidget")
-                        if ok_iw then
-                            local ok_cp, bb_copy = pcall(function()
-                                return bi.cover_bb:copy() end)
-                            if ok_cp and bb_copy then
-                                local ok_img, img = pcall(IW.new, IW, {
-                                    image=bb_copy, scale_factor=sf,
-                                    image_disposable=true,
-                                })
-                                if ok_img and img then
-                                    local ok_sz, img_sz = pcall(function()
-                                        return img:getSize() end)
-                                    local ah = COVER_H
-                                    if ok_sz and img_sz and img_sz.h > 0 then
-                                        ah = math.min(img_sz.h, COVER_H)
-                                    end
-                                    cover_widget = FrameContainer:new{
-                                        padding=0, bordersize=0,
-                                        width=COVER_W, height=COVER_H,
-                                        BottomContainer:new{
-                                            dimen=Geom:new{w=COVER_W, h=COVER_H},
-                                            CenterContainer:new{
-                                                dimen=Geom:new{w=COVER_W, h=ah},
-                                                img,
-                                            },
-                                        },
-                                    }
-                                end
-                            end
-                        end
-                    end
+            local path = CoverUtil.findPathForTitle(self_cell.title_path_map, book.title, book)
+            local img = path and CoverUtil.getCoverWidget(path, COVER_W, COVER_H)
+            if img then
+                local ok_sz, img_sz = pcall(function() return img:getSize() end)
+                local ah = COVER_H
+                if ok_sz and img_sz and img_sz.h > 0 then
+                    ah = math.min(img_sz.h, COVER_H)
                 end
+                cover_widget = FrameContainer:new{
+                    padding=0, bordersize=0,
+                    width=COVER_W, height=COVER_H,
+                    BottomContainer:new{
+                        dimen=Geom:new{w=COVER_W, h=COVER_H},
+                        CenterContainer:new{
+                            dimen=Geom:new{w=COVER_W, h=ah},
+                            img,
+                        },
+                    },
+                }
             end
         end
         if not cover_widget then
-            cover_widget = FrameContainer:new{
-                padding=4, bordersize=1, radius=Screen:scaleBySize(4),
-                width=COVER_W, height=COVER_H,
-                background=Blitbuffer.COLOR_LIGHT_GRAY,
-                CenterContainer:new{
-                    dimen=Geom:new{w=COVER_W-8, h=COVER_H-8},
-                    TextWidget:new{
-                        text=book.title:sub(1,6), face=lbl_face,
-                        fgcolor=Blitbuffer.COLOR_BLACK,
-                    },
-                },
-            }
+            cover_widget = CoverUtil.makeTitleChip(book.title, COVER_W, COVER_H, {font_size=9})
         end
 
         -- Book info column — use max_width on TextWidget so KOReader's own
@@ -954,6 +930,16 @@ function CoverCalendarView:init()
         },
     }
 
+    -- Page-turn buttons change month and Back closes, on devices that have
+    -- them — no need to aim at the screen at all.
+    if Device:hasKeys() and Device.input and Device.input.group then
+        local group = Device.input.group
+        self.key_events = self.key_events or {}
+        if group.Back   then self.key_events.Close        = { { group.Back } } end
+        if group.PgFwd  then self.key_events.NextMonthKey = { { group.PgFwd } } end
+        if group.PgBack then self.key_events.PrevMonthKey = { { group.PgBack } } end
+    end
+
     -- Two-phase loading strategy:
     -- On the FIRST open (cold cache): show a skeleton immediately so the
     -- screen isn't black while BookInfoManager opens EPUBs, then load
@@ -993,7 +979,14 @@ function CoverCalendarView:_build()
     local YEAR_H  = Screen:scaleBySize(20)
     local MONTH_H = Screen:scaleBySize(44)
     local HDR_H   = YEAR_H + MONTH_H + Screen:scaleBySize(8)
-    local CORNER_H = YEAR_H + Screen:scaleBySize(16)
+
+    -- Corner controls. Each one is a touch target as tall as the whole
+    -- header; the arrows and the close button are also ARROW_W / CLOSE_W
+    -- wide and sit flush against the screen edge, so a thumb landing
+    -- anywhere in the corner hits them. (They used to be only as big as the
+    -- glyph plus a few pixels of padding.)
+    local ARROW_W = Screen:scaleBySize(58)
+    local CLOSE_W = Screen:scaleBySize(62)
 
     local header = OverlapGroup:new{
         dimen = Geom:new{w=SW, h=HDR_H},
@@ -1023,30 +1016,26 @@ function CoverCalendarView:_build()
                 },
             },
         },
-        -- Page-turn arrows pinned top-left, plus a "Today" jump that only
+        -- Month arrows pinned top-left, plus a "Today" jump that only
         -- appears when a different month than the current one is displayed
         (function()
             local now = os.date("*t")
             local nav = HorizontalGroup:new{ overlap=false,
-                Button:new{
-                    text="‹", bordersize=0,
-                    padding=Screen:scaleBySize(8),
+                CoverUtil.headerButton{
+                    text="‹", font_size=32,
+                    width=ARROW_W, height=HDR_H,
                     callback=function() self:_prevMonth() end,
                 },
-                HorizontalSpan:new{width=Screen:scaleBySize(2)},
-                Button:new{
-                    text="›", bordersize=0,
-                    padding=Screen:scaleBySize(8),
+                CoverUtil.headerButton{
+                    text="›", font_size=32,
+                    width=ARROW_W, height=HDR_H,
                     callback=function() self:_nextMonth() end,
                 },
             }
             if self.year ~= now.year or self.month ~= now.month then
-                table.insert(nav, HorizontalSpan:new{width=Screen:scaleBySize(6)})
-                table.insert(nav, Button:new{
-                    text=_("Today"), bordersize=0,
-                    text_font_face="cfont",
-                    text_font_size=16,
-                    padding=Screen:scaleBySize(6),
+                table.insert(nav, CoverUtil.headerButton{
+                    text=_("Today"), font_size=16,
+                    height=HDR_H,
                     callback=function()
                         local t = os.date("*t")
                         self.year, self.month = t.year, t.month
@@ -1055,26 +1044,20 @@ function CoverCalendarView:_build()
                     end,
                 })
             end
-            return FrameContainer:new{
-                padding=0, padding_left=Screen:scaleBySize(6), bordersize=0,
-                nav,
-            }
+            return nav
         end)(),
         -- Top-right: yearly overview + close
         RightContainer:new{
-            dimen = Geom:new{w=SW - Screen:scaleBySize(6), h=CORNER_H},
+            dimen = Geom:new{w=SW, h=HDR_H},
             HorizontalGroup:new{ overlap=false,
-                Button:new{
-                    text=_("Year"), bordersize=0,
-                    text_font_face="cfont",
-                    text_font_size=16,
-                    padding=Screen:scaleBySize(6),
+                CoverUtil.headerButton{
+                    text=_("Year"), font_size=16,
+                    height=HDR_H,
                     callback=function() self:_openYearView() end,
                 },
-                HorizontalSpan:new{width=Screen:scaleBySize(6)},
-                Button:new{
-                    text="✕", bordersize=0,
-                    padding=Screen:scaleBySize(6),
+                CoverUtil.headerButton{
+                    text="✕", font_size=26,
+                    width=CLOSE_W, height=HDR_H,
                     callback=function() self:onClose() end,
                 },
             },
@@ -1387,6 +1370,16 @@ function CoverCalendarView:_build()
     else
         UIManager:setDirty(self, "ui")
     end
+
+    -- Covers that were not in KOReader's cache were queued while the cells
+    -- above were built (they show a title chip for now). Start fetching
+    -- them in the background and rebuild when they arrive.
+    local self_ref = self
+    CoverUtil.requestPendingCovers(self, function()
+        if self_ref._closed then return end
+        self_ref._covers_loaded = true
+        self_ref:_build()
+    end)
 end
 
 function CoverCalendarView:_pickMonthYear()
@@ -1518,14 +1511,30 @@ function CoverCalendarView:onSwipe(_, ges)
     if ges.direction == "right" then self:_prevMonth(); return true end
 end
 
+function CoverCalendarView:onNextMonthKey()
+    self:_nextMonth()
+    return true
+end
+
+function CoverCalendarView:onPrevMonthKey()
+    self:_prevMonth()
+    return true
+end
+
 function CoverCalendarView:onClose()
     -- Mark covers as loaded so any pending scheduled rebuild doesn't fire
     -- after the view has been closed and freed.
     self._covers_loaded = true
-    -- Free the cover cache immediately on close so BlitBuffer C memory
-    -- is released back to the OS rather than waiting for Lua GC.
-    CoverUtil.clearCoverCache()
+    self._closed = true
+    CoverUtil.forgetListener(self)
     UIManager:close(self, "full")
+    return true
+end
+
+-- Also reached when something else closes the view.
+function CoverCalendarView:onCloseWidget()
+    self._closed = true
+    CoverUtil.forgetListener(self)
 end
 
 function CoverCalendarView:onShow()

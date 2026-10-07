@@ -1,5 +1,9 @@
 --[[
-    coveryearview.lua  (v3)
+    coveryearview.lua  (v3, updated for plugin 2.0.2)
+
+    2.0.2: books are looked up with their author and file checksum (see
+    coverutil.lua), uncached covers arrive in the background, and the header
+    controls are full-height touch targets like the monthly view's.
 
     Year-in-books overview for the CoverCalendar plugin, in the same flat
     design language as the monthly calendar.
@@ -97,7 +101,8 @@ local function loadYearData(db_path, year)
             b.pages AS pages,
             b.total_read_pages AS total_read_pages,
             SUM(psd.duration) AS dur,
-            COUNT(DISTINCT psd.page) AS pages_today
+            COUNT(DISTINCT psd.page) AS pages_today,
+            b.md5 AS md5
         FROM page_stat_data psd
         JOIN book b ON b.id = psd.id_book
         WHERE psd.start_time >= %d AND psd.start_time <= %d
@@ -116,7 +121,7 @@ local function loadYearData(db_path, year)
     end
 
     -- column-major: 1=ds 2=book_id 3=title 4=authors 5=pages
-    --               6=total_read_pages 7=dur 8=pages_today
+    --               6=total_read_pages 7=dur 8=pages_today 9=md5
     local n_rows = #res[1]
     logger.info("CoverCalendar(year): loadYearData got", n_rows, "rows for", year)
     for i = 1, n_rows do
@@ -134,6 +139,7 @@ local function loadYearData(db_path, year)
                 authors = res[4] and res[4][i] or "",
                 pages   = tonumber(res[5] and res[5][i]) or 0,
                 total_read_pages = tonumber(res[6] and res[6][i]) or 0,
+                md5     = res[9] and res[9][i] or nil,
                 sessions = {},
             }
             agg.books[bid] = bk
@@ -253,7 +259,6 @@ function MonthRow:init()
     local cover_w = math.max(8, math.floor(cover_h * COVER_ASPECT))
 
     local lbl_face  = Font:getFace("cfont", MONTH_LBL_SIZE)
-    local chip_face = Font:getFace("cfont", CHIP_SIZE)
 
     local row_content = HorizontalGroup:new{ overlap=false }
 
@@ -290,19 +295,12 @@ function MonthRow:init()
                     },
                 }
             else
-                -- Fallback chip: abbreviated title (covers deleted books too)
-                boxed = FrameContainer:new{
-                    padding=2, bordersize=1, radius=Screen:scaleBySize(3),
-                    width=cover_w, height=cover_h,
-                    background=Blitbuffer.COLOR_WHITE,
-                    CenterContainer:new{
-                        dimen=Geom:new{w=cover_w-4, h=cover_h-4},
-                        TextWidget:new{
-                            text=b.title:sub(1, 8), face=chip_face,
-                            fgcolor=Blitbuffer.COLOR_BLACK,
-                        },
-                    },
-                }
+                -- Fallback chip with the wrapped title (covers deleted
+                -- books too)
+                boxed = CoverUtil.makeTitleChip(b.title, cover_w, cover_h, {
+                    font_size = CHIP_SIZE,
+                    background = Blitbuffer.COLOR_WHITE,
+                })
             end
             table.insert(row_content, boxed)
             table.insert(row_content, HorizontalSpan:new{width=INNER})
@@ -394,6 +392,14 @@ function CoverYearView:init()
             }
         },
     }
+
+    if Device:hasKeys() and Device.input and Device.input.group then
+        local group = Device.input.group
+        self.key_events = self.key_events or {}
+        if group.Back   then self.key_events.Close       = { { group.Back } } end
+        if group.PgFwd  then self.key_events.NextPageKey = { { group.PgFwd } } end
+        if group.PgBack then self.key_events.PrevPageKey = { { group.PgBack } } end
+    end
 
     -- Same two-phase strategy as the monthly view: when opened from the
     -- calendar the cover cache is normally already warm, so this almost
@@ -588,7 +594,9 @@ function CoverYearView:_build()
     local LBL_H   = Screen:scaleBySize(20)
     local BIGY_H  = Screen:scaleBySize(44)
     local HDR_H   = LBL_H + BIGY_H + Screen:scaleBySize(8)
-    local CORNER_H = LBL_H + Screen:scaleBySize(16)
+    -- Corner controls are full-header-height touch targets (see the monthly
+    -- view for the reasoning).
+    local ARROW_W = Screen:scaleBySize(58)
 
     local header = OverlapGroup:new{
         dimen = Geom:new{w=SW, h=HDR_H},
@@ -615,50 +623,38 @@ function CoverYearView:_build()
             },
         },
         -- Page-turn arrows top-left: previous / next chunk (rolls over years)
-        FrameContainer:new{
-            padding=0, padding_left=Screen:scaleBySize(6), bordersize=0,
-            HorizontalGroup:new{ overlap=false,
-                Button:new{
-                    text="‹", bordersize=0,
-                    padding=Screen:scaleBySize(8),
-                    callback=function() self:_prevPage() end,
-                },
-                HorizontalSpan:new{width=Screen:scaleBySize(2)},
-                Button:new{
-                    text="›", bordersize=0,
-                    padding=Screen:scaleBySize(8),
-                    callback=function() self:_nextPage() end,
-                },
+        HorizontalGroup:new{ overlap=false,
+            CoverUtil.headerButton{
+                text="‹", font_size=32,
+                width=ARROW_W, height=HDR_H,
+                callback=function() self:_prevPage() end,
+            },
+            CoverUtil.headerButton{
+                text="›", font_size=32,
+                width=ARROW_W, height=HDR_H,
+                callback=function() self:_nextPage() end,
             },
         },
         -- Top-right: Finished/Read toggle + layout toggle (12M ⇄ 6M) + Back
         RightContainer:new{
-            dimen = Geom:new{w=SW - Screen:scaleBySize(6), h=CORNER_H},
+            dimen = Geom:new{w=SW, h=HDR_H},
             HorizontalGroup:new{ overlap=false,
-                Button:new{
+                CoverUtil.headerButton{
                     text=(self.show_mode == "read") and _("Read") or _("Finished"),
-                    bordersize=0,
-                    text_font_face="cfont",
-                    text_font_size=16,
-                    text_font_bold=true,
-                    padding=Screen:scaleBySize(6),
+                    font_size=16, height=HDR_H,
+                    pad_h=Screen:scaleBySize(8),
                     callback=function() self:_toggleMode() end,
                 },
-                HorizontalSpan:new{width=Screen:scaleBySize(8)},
-                Button:new{
-                    text=tostring(size) .. "M", bordersize=0,
-                    text_font_face="cfont",
-                    text_font_size=16,
-                    text_font_bold=true,
-                    padding=Screen:scaleBySize(6),
+                CoverUtil.headerButton{
+                    text=tostring(size) .. "M",
+                    font_size=16, height=HDR_H,
+                    pad_h=Screen:scaleBySize(8),
                     callback=function() self:_cycleLayout() end,
                 },
-                HorizontalSpan:new{width=Screen:scaleBySize(8)},
-                Button:new{
-                    text=_("Back"), bordersize=0,
-                    text_font_face="cfont",
-                    text_font_size=16,
-                    padding=Screen:scaleBySize(6),
+                CoverUtil.headerButton{
+                    text=_("Back"),
+                    font_size=16, height=HDR_H,
+                    pad_h=Screen:scaleBySize(12),
                     callback=function() self:onClose() end,
                 },
             },
@@ -751,6 +747,14 @@ function CoverYearView:_build()
     else
         UIManager:setDirty(self, "ui")
     end
+
+    -- Fetch covers that were not cached yet; repaint when they arrive.
+    local view = self
+    CoverUtil.requestPendingCovers(self, function()
+        if view._closed then return end
+        view._covers_loaded = true
+        view:_build()
+    end)
 end
 
 -- ── Paging (rolls across years) and layout cycling ────────────────────────────
@@ -796,9 +800,27 @@ function CoverYearView:onSwipe(_, ges)
     if ges.direction == "right" then self:_prevPage(); return true end
 end
 
+function CoverYearView:onNextPageKey()
+    self:_nextPage()
+    return true
+end
+
+function CoverYearView:onPrevPageKey()
+    self:_prevPage()
+    return true
+end
+
 function CoverYearView:onClose()
     self._covers_loaded = true
+    self._closed = true
+    CoverUtil.forgetListener(self)
     UIManager:close(self, "full")
+    return true
+end
+
+function CoverYearView:onCloseWidget()
+    self._closed = true
+    CoverUtil.forgetListener(self)
 end
 
 function CoverYearView:onShow()

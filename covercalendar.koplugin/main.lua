@@ -20,7 +20,7 @@ local _ = require("gettext")
 local CoverCalendarView = require("covercalendarview")
 local Updater = require("updater")
 
-local PLUGIN_VERSION = "2.0.1"
+local PLUGIN_VERSION = "2.0.2"
 
 local CoverCalendar = WidgetContainer:extend{
     name = "covercalendar",
@@ -282,6 +282,15 @@ function CoverCalendar:addToMainMenu(menu_items)
                     },
                 },
             },
+            -- Lists the books the calendar has no cover for, and why. The
+            -- first thing to ask for when someone reports missing covers.
+            {
+                text = _("Missing covers report"),
+                keep_menu_open = true,
+                callback = function()
+                    self:showMissingCoverReport()
+                end,
+            },
             {
                 text = _("About"),
                 keep_menu_open = true,
@@ -321,6 +330,26 @@ function CoverCalendar:addToMainMenu(menu_items)
             },
         },
     }
+end
+
+-- ── Missing covers report ─────────────────────────────────────────────────────
+
+function CoverCalendar:showMissingCoverReport()
+    local db_path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+    local lfs = require("libs/libkoreader-lfs")
+    if not lfs.attributes(db_path, "mode") then
+        UIManager:show(InfoMessage:new{
+            text = _("No reading statistics database found.\nPlease enable the Statistics plugin and read some books first."),
+        })
+        return
+    end
+    local CoverUtil = require("coverutil")
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title = _("Missing covers"),
+        text = "Cover Calendar " .. PLUGIN_VERSION .. "\n\n"
+            .. CoverUtil.missingCoverReport(db_path, 365),
+    })
 end
 
 -- ── Open the calendar ─────────────────────────────────────────────────────────
